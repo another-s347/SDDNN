@@ -1,0 +1,16 @@
+buildings/
+forest/
+glacier/
+mountain/
+sea/
+street/
+split_ckp/
+Test/
+target/
+__pycache__
+**/*.pt
+*.lock
+.idea/
+Regular/
+runs/
+Binary/
