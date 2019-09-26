@@ -7,7 +7,7 @@ import torchvision
 import torchvision.transforms as transforms
 import os
 import argparse
-from utils import progress_bar
+# from utils import progress_bar
 import math
 
 criterion = nn.CrossEntropyLoss()
@@ -26,7 +26,7 @@ class BasicBlock(nn.Module):
 
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
-        print(f"Building basic block {in_planes} => {planes}")
+        # print(f"Building basic block {in_planes} => {planes}")
         self.conv1 = nn.Conv2d(
             in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
@@ -77,7 +77,7 @@ class DeviceClassifier(nn.Module):
     def __init__(self, num_classes=6):
         super(DeviceClassifier, self).__init__()
         self.pool = nn.AdaptiveAvgPool2d((8, 8))
-        self.linear = nn.Linear(4096, num_classes)
+        self.linear = nn.Linear(3072, num_classes)
         self.softmax = nn.Softmax(-1)
 
     def forward(self, x):
@@ -115,7 +115,7 @@ class EdgeClassifier(nn.Module):
     def __init__(self, num_classes=6):
         super(EdgeClassifier, self).__init__()
         self.pool = nn.AdaptiveAvgPool2d((5, 5))
-        self.linear = nn.Linear(1200, num_classes)
+        self.linear = nn.Linear(3200, num_classes)
         self.softmax = nn.Softmax(-1)
 
     def forward(self, x):
@@ -166,7 +166,7 @@ class Model:
         self.main_model = MainRoadModel(
             self.device_main, self.device_extract, self.edge_main, self.cloud)
         self.device_classifier_model = DeviceClassifierModel(
-            self.device_main, self.device_classifier)
+            self.device_main, self.device_classifier, self.device_extract)
         self.edge_classifier_model = EdgeClassifierModel(
             self.device_main, self.device_extract,
             self.edge_main, self.edge_classifier)
@@ -176,13 +176,13 @@ class Model:
 
     def cuda(self):
         self.main_model.cuda()
-        self.device_classifier_model.cuda()
-        self.edge_classifier_model.cuda()
+        self.device_classifier.cuda()
+        self.edge_classifier.cuda()
 
     def cpu(self):
         self.main_model.cpu()
-        self.device_classifier_model.cpu()
-        self.edge_classifier_model.cpu()
+        self.device_classifier.cpu()
+        self.edge_classifier.cpu()
 
     def save_main(self):
         print("Saving Main Model...")
@@ -203,9 +203,9 @@ class Model:
         torch.save(self.edge_classifier.state_dict(),
                    './split_ckp/edge_classifier.pth')
 
-    def load_device(self,device):
+    def load_device(self,device,path='./split_ckp/'):
         self.device_classifier.load_state_dict(
-            torch.load('./split_ckp/device_classifier.pth',map_location=torch.device(device)))
+            torch.load(path+'device_classifier.pth',map_location=torch.device(device)))
 
     def load_edge(self,device):
         self.edge_main.load_state_dict(torch.load('./split_ckp/edge_main.pth',map_location=device))
@@ -220,17 +220,17 @@ class Model:
         self.edge_main.load_state_dict(torch.load('./split_ckp/edge_main.pth',map_location=torch.device(device)))
         self.cloud.load_state_dict(torch.load('./split_ckp/cloud.pth',map_location=torch.device(device)))
 
-    def load(self):
+    def load(self,device,path='.'):
         self.device_main.load_state_dict(
-            torch.load('./split_ckp/device_main.pth'))
+            torch.load(path+'/split_ckp/device_main.pth',map_location=torch.device(device)))
         self.device_extract.load_state_dict(
-            torch.load('./split_ckp/device_extract.pth'))
+            torch.load(path+'/split_ckp/device_extract.pth',map_location=torch.device(device)))
         self.device_classifier.load_state_dict(
-            torch.load('./split_ckp/device_classifier.pth'))
+            torch.load(path+'/split_ckp/device_classifier.pth',map_location=torch.device(device)))
         self.edge_classifier.load_state_dict(
-            torch.load('./split_ckp/edge_classifier.pth'))
-        self.edge_main.load_state_dict(torch.load('./split_ckp/edge_main.pth'))
-        self.cloud.load_state_dict(torch.load('./split_ckp/cloud.pth'))
+            torch.load(path+'/split_ckp/edge_classifier.pth',map_location=torch.device(device)))
+        self.edge_main.load_state_dict(torch.load(path+'/split_ckp/edge_main.pth',map_location=torch.device(device)))
+        self.cloud.load_state_dict(torch.load(path+'/split_ckp/cloud.pth',map_location=torch.device(device)))
 
     def save_jit(self):
         self.device_main.eval()
@@ -240,10 +240,10 @@ class Model:
         self.edge_main.eval()
         self.cloud.eval()
         torch.jit.trace(self.device_main, torch.rand(1, 3, 150, 150)).save("device_main.pt")
-        torch.jit.trace(self.device_classifier, torch.rand(1, 64, 150, 150)).save("device_classifier.pt")
+        torch.jit.trace(self.device_classifier, torch.rand(1, 48, 5, 5)).save("device_classifier.pt")
         torch.jit.trace(self.device_extract, torch.rand(1, 64, 150, 150)).save("device_extract.pt")
         torch.jit.trace(self.edge_main, torch.rand(1, 48, 5, 5)).save("edge_main.pt")
-        torch.jit.trace(self.edge_classifier, torch.rand(1, 48, 5, 5)).save("edge_classifier.pt")
+        torch.jit.trace(self.edge_classifier, torch.rand(1, 128, 5, 5)).save("edge_classifier.pt")
         torch.jit.trace(self.cloud, torch.rand(1, 128, 3, 3)).save("cloud.pt")
 
 
@@ -272,11 +272,11 @@ class Model:
                 inputs, targets = inputs.to(device), targets.to(device)
 
                 device_main_outputs = self.device_main(inputs)
-                device_outputs = self.device_classifier(device_main_outputs)
                 device_to_edge = self.device_extract(device_main_outputs)
+                device_outputs = self.device_classifier(device_to_edge)
 
                 edge_main_outputs = self.edge_main(device_to_edge)
-                edge_outputs = self.edge_classifier(device_to_edge)
+                edge_outputs = self.edge_classifier(edge_main_outputs)
 
                 cloud_outputs = self.cloud(edge_main_outputs)
 
@@ -328,9 +328,11 @@ class Model:
         with torch.no_grad():
             for batch_idx, (inputs, targets) in enumerate(testloader):
                 total += targets.size(0)
+                print(targets)
                 inputs, targets = inputs.to(device), targets.to(device)
                 device_main_outputs = self.device_main(inputs)
-                device_outputs = self.device_classifier(device_main_outputs)
+                device_to_edge = self.device_extract(device_main_outputs)
+                device_outputs = self.device_classifier(device_to_edge)
 
                 device_outputs = nn.Softmax(-1)(device_outputs)
                 device_t = entropy(device_outputs)
@@ -340,8 +342,8 @@ class Model:
                     mid_exit += 1
                     correct += device_predicted.eq(targets).sum().item()
                 else:
-                    device_to_edge = self.device_extract(device_main_outputs)
-                    edge_outputs = self.edge_classifier(device_to_edge)
+                    edge_main_outputs = self.edge_main(device_to_edge)
+                    edge_outputs = self.edge_classifier(edge_main_outputs)
                     edge_outputs = nn.Softmax(-1)(edge_outputs)
                     edge_t = entropy(edge_outputs)
                     if edge_t < mid_t:
@@ -349,7 +351,6 @@ class Model:
                         correct += edge_predicted.eq(targets).sum().item()
                         mid_exit += 1
                     else:
-                        edge_main_outputs = self.edge_main(device_to_edge)
                         cloud_outputs = self.cloud(edge_main_outputs)
                         _, cloud_predicted = cloud_outputs.max(1)
                         correct += cloud_predicted.eq(targets).sum().item()
@@ -375,13 +376,15 @@ class MainRoadModel(nn.Module):
 
 
 class DeviceClassifierModel(nn.Module):
-    def __init__(self, device_main: DeviceMain, device_classifier: DeviceClassifier):
+    def __init__(self, device_main: DeviceMain, device_classifier: DeviceClassifier, device_extract: DeviceExtract):
         super(DeviceClassifierModel, self).__init__()
         self.device_main = device_main
+        self.device_extract = device_extract
         self.device_classifier = device_classifier
 
     def forward(self, x):
         out = self.device_main(x)
+        out = self.device_extract(out)
         return self.device_classifier(out)
 
 
@@ -390,9 +393,11 @@ class EdgeClassifierModel(nn.Module):
         super(EdgeClassifierModel, self).__init__()
         self.device_main = device_main
         self.device_extract = device_extract
+        self.edge_main = edge_main
         self.edge_classifier = edge_classifier
 
     def forward(self, x):
         out = self.device_main(x)
         out = self.device_extract(out)
+        out = self.edge_main(out)
         return self.edge_classifier(out)

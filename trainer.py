@@ -96,6 +96,7 @@ class DeviceTrainer:
     def train(self, epoch, lr):
         print(f'\nTrain:Device, Epoch:{epoch}')
         self.model.device_main.eval()
+        self.model.device_extract.eval()
         self.model.device_classifier.train()
         optimizer = optim.SGD(self.model.device_classifier.parameters(
         ), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -107,6 +108,7 @@ class DeviceTrainer:
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             optimizer.zero_grad()
             outputs = self.model.device_main(inputs)
+            outputs = self.model.device_extract(outputs)
             outputs = self.model.device_classifier(outputs)
             loss = criterion(outputs, targets)
             loss.backward()
@@ -143,7 +145,7 @@ class DeviceTrainer:
             return False
 
     def load(self):
-        self.model.load_device()
+        self.model.load_device(self.device)
         return self.best_epoch
 
 
@@ -161,6 +163,7 @@ class EdgeTrainer:
         print(f'\nTrain:Edge, Epoch:{epoch}')
         self.model.device_main.eval()
         self.model.device_extract.eval()
+        self.model.edge_main.eval()
         self.model.edge_classifier.train()
         optimizer = optim.SGD(self.model.edge_classifier.parameters(
         ), lr=lr, momentum=0.9, weight_decay=5e-4)
@@ -172,6 +175,7 @@ class EdgeTrainer:
             optimizer.zero_grad()
             outputs = self.model.device_main(inputs)
             outputs = self.model.device_extract(outputs)
+            outputs = self.model.edge_main(outputs)
             outputs = self.model.edge_classifier(outputs)
             loss = criterion(outputs, targets)
             loss.backward()

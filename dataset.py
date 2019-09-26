@@ -13,6 +13,7 @@ from model import Model
 import trainer
 import math
 import numpy
+import matplotlib.pyplot as plt
 
 transform_test = transforms.Compose([
     transforms.Resize((150, 150)),
@@ -34,3 +35,12 @@ for batch_idx, (inputs, targets) in enumerate(testloader):
         target = classes[targets[0]]
         numpy.save(f"{target}/{index}.npy",image.numpy())
         index += 1
+
+predset = torchvision.datasets.ImageFolder(
+    root='/home/skye/intel-image/seg_pred', transform=transform_test)
+
+for item_index, (t,target) in enumerate(predset):
+    path,_ = predset.imgs[item_index]
+    t = t.unsqueeze(0)
+    filename = os.path.basename(path).split('.')[0]
+    numpy.save(f"unknown/{filename}.npy",t.numpy())

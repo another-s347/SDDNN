@@ -7,12 +7,15 @@ use model::{EdgeResponse, DeviceRequest, TensorRepresentation, EdgeRequest, Clou
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tch::{CModule, Tensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tch::nn::Module;
 use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
 use flate2::write::{GzEncoder, GzDecoder};
 use std::io::prelude::*;
+use std::str::FromStr;
+use std::fs::DirBuilder;
+use std::process::ExitStatus;
 
 pub fn entropy(t:&Tensor) -> f64 {
     let c = (t.size()[1] as f64).log(2.);
@@ -26,7 +29,10 @@ pub fn entropy(t:&Tensor) -> f64 {
 struct EdgeWorker {
     classifier:CModule,
     main_path:CModule,
-    threshold:f64
+    threshold:f64,
+    trainset_buffer:Vec<Tensor>,
+    trainlabel_buffer:Vec<i64>,
+    edge_service:Option<Addr<EdgeService>>
 }
 
 impl EdgeWorker {
@@ -34,21 +40,37 @@ impl EdgeWorker {
         EdgeWorker {
             classifier: tch::CModule::load(classifier).unwrap(),
             main_path: tch::CModule::load(main_path).unwrap(),
-            threshold: 0.1
+            threshold: 0.1,
+            trainset_buffer: vec![],
+            trainlabel_buffer: vec![],
+            edge_service: None
         }
     }
 }
 
 impl Actor for EdgeWorker {
-    type Context = SyncContext<Self>;
+    type Context = Context<Self>;
 }
 
 impl Handler<Eval> for EdgeWorker {
     type Result = Result<EvalResult,()>;
 
     fn handle(&mut self, msg: Eval, ctx: &mut Self::Context) -> Self::Result {
-        let classifier_result = self.classifier.forward(&msg.xs).softmax(-1);
+        let extracted = self.main_path.forward(&msg.xs);
+        let classifier_result = self.classifier.forward(&extracted).softmax(-1);
         if entropy(&classifier_result) < self.threshold {
+            // save sample
+            let pred = classifier_result.argmax(-1,false).int64_value(&[]);
+            self.trainset_buffer.push(msg.xs);
+            self.trainlabel_buffer.push(pred);
+            if self.trainset_buffer.len() > 100 {
+                msg.reply.try_send(
+                    TrainDeviceClassifier {
+                        trainset: self.trainset_buffer.drain(0..).collect(),
+                        label: self.trainlabel_buffer.drain(0..).collect()
+                    }
+                );
+            }
             // exit
             println!("Task {}",msg.task_id);
             classifier_result.argmax(-1,false).print();
@@ -60,7 +82,6 @@ impl Handler<Eval> for EdgeWorker {
         }
         else {
             // To cloud
-            let extracted = self.main_path.forward(&msg.xs);
             Ok(EvalResult::ToCloud {
                 client_address: msg.client_address,
                 task_id: msg.task_id,
@@ -70,15 +91,29 @@ impl Handler<Eval> for EdgeWorker {
     }
 }
 
+impl Handler<EdgeServiceStart> for EdgeWorker {
+    type Result = ();
+
+    fn handle(&mut self, msg: EdgeServiceStart, ctx: &mut Self::Context) -> Self::Result {
+        self.edge_service.replace(msg.0);
+    }
+}
+
 struct EdgeService {
     // clients
     clients: HashMap<SocketAddr,Addr<ClientAgent>>,
     worker: Addr<EdgeWorker>,
-    cloud_writer:Sender<Bytes>
+    cloud_writer:Sender<Bytes>,
+    device_trainer:Addr<DeviceClassifierTraniner>
 }
 
 impl Actor for EdgeService {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        self.worker.send(EdgeServiceStart(ctx.address()));
+        self.device_trainer.try_send(EdgeServiceStart(ctx.address()));
+    }
 }
 
 impl StreamHandler<TcpStream,std::io::Error> for EdgeService {
@@ -126,11 +161,19 @@ impl Handler<ClientAgentStopped> for EdgeService {
     }
 }
 
+impl Handler<TrainDeviceClassifier> for EdgeService {
+    type Result = ();
+
+    fn handle(&mut self, msg: TrainDeviceClassifier, ctx: &mut Self::Context) -> Self::Result {
+        self.device_trainer.try_send(msg).unwrap();
+    }
+}
+
 // cloud traffic
 impl StreamHandler<bytes::BytesMut, std::io::Error> for EdgeService {
     fn handle(&mut self, item: bytes::BytesMut, ctx: &mut Self::Context) {
         if let Ok(response) = bincode::deserialize::<CloudResponse>(item.as_ref()) {
-            self.clients.get(&response.client_address).unwrap().try_send(EdgeResponse {
+            self.clients.get(&response.client_address).unwrap().try_send(EdgeResponse::EvalResult {
                 id: response.id,
                 prob: response.prob
             }).unwrap();
@@ -171,6 +214,7 @@ impl StreamHandler<bytes::BytesMut,std::io::Error> for ClientAgent {
                     let my_addr = ctx.address();
                     let task = self.worker.send(
                         Eval {
+                            reply: self.edge.clone(),
                             client_address: self.remote_address,
                             task_id: id,
                             xs: tensor.to_tensor()
@@ -204,7 +248,7 @@ impl Handler<EvalResult> for ClientAgent {
             EvalResult::ToClient {
                 client_address, task_id, result
             } => {
-                let edge_result = bincode::serialize(&EdgeResponse {
+                let edge_result = bincode::serialize(&EdgeResponse::EvalResult {
                     id: task_id,
                     prob: TensorRepresentation::from_tensor(&result)
                 }).unwrap();
@@ -233,10 +277,134 @@ impl Handler<EdgeResponse> for ClientAgent {
     }
 }
 
+impl Handler<SendTrainedClassifier> for ClientAgent {
+    type Result = ();
+
+    fn handle(&mut self, msg: SendTrainedClassifier, ctx: &mut Self::Context) -> Self::Result {
+        let edge_result = bincode::serialize(&EdgeResponse::ClassifierUpdate {
+            module: msg.file
+        }).unwrap();
+        self.writer.try_send(Bytes::from(edge_result)).unwrap();
+    }
+}
+
+struct DeviceClassifierTraniner {
+    pub edge_service:Option<Addr<EdgeService>>,
+    pub old_classifier_path:PathBuf,
+    pub old_classifier:CModule,
+    pub indexer:usize
+}
+
+impl DeviceClassifierTraniner {
+    pub fn new(classifier:&str) -> DeviceClassifierTraniner {
+        DeviceClassifierTraniner {
+            edge_service: None,
+            old_classifier_path: PathBuf::from_str(classifier).unwrap(),
+            old_classifier: tch::CModule::load(classifier).unwrap(),
+            indexer: 0
+        }
+    }
+}
+
+impl Actor for DeviceClassifierTraniner {
+    type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+//        std::fs::remove_dir("/tmp/sddnn").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/0").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/1").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/2").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/3").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/4").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/train_set/5").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/0").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/1").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/2").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/3").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/4").unwrap();
+        DirBuilder::new().recursive(true).create("/tmp/sddnn/test_set/5").unwrap();
+    }
+}
+
+impl Handler<EdgeServiceStart> for DeviceClassifierTraniner {
+    type Result = ();
+
+    fn handle(&mut self, msg: EdgeServiceStart, ctx: &mut Self::Context) -> Self::Result {
+        self.edge_service = Some(msg.0);
+    }
+}
+
+impl Handler<TrainDeviceClassifier> for DeviceClassifierTraniner {
+    type Result = ();
+
+    fn handle(&mut self, mut msg: TrainDeviceClassifier, ctx: &mut Self::Context) -> Self::Result {
+        if msg.trainset.len()!=msg.label.len() {
+            println!("[ERR] len(trainset)!=len(label)");
+            return;
+        }
+        let len = msg.trainset.len()/2;
+        let train_set: Vec<Tensor> = msg.trainset.drain(0..len).collect();
+        let train_label:Vec<i64> = msg.label.drain(0..len).collect();
+        let test_set = msg.trainset;
+        let test_label = msg.label;
+        for (tensor,target) in train_set.iter().zip(train_label.iter()) {
+            let path = format!("/tmp/sddnn/train_set/{}/{}.npy",target,self.indexer);
+            tensor.write_npy(&path).unwrap();
+            self.indexer+=1;
+        }
+        for (tensor,target) in test_set.iter().zip(test_label.iter()) {
+            let path = format!("/tmp/sddnn/test_set/{}/{}.npy",target,self.indexer);
+            tensor.write_npy(&path).unwrap();
+            self.indexer+=1;
+        }
+        let addr= self.edge_service.as_ref().unwrap().clone();
+        actix::spawn(futures::future::lazy(move|| {
+            let mut exit = std::process::Command::new("python3")
+                .arg("/home/skye/SDDNN/train_device_classifier.py")
+                .current_dir("/home/skye/SDDNN")
+                .output()
+                .unwrap();
+            let mut outputs = exit
+                .status;
+            match outputs.code() {
+                Some(0) => {
+                    if let Ok(module) = std::fs::read("/tmp/sddnn/device_classifier.pt") {
+                        addr.try_send(SendTrainedClassifier {
+                            path: "/tmp/sddnn/device_classifier.pt",
+                            file: module
+                        });
+                    }
+                }
+                _ => {
+                    println!("not trained: {}", String::from_utf8_lossy(exit.stdout.as_ref()));
+                }
+            }
+            Ok(())
+        }));
+    }
+}
+
+impl Handler<SendTrainedClassifier> for EdgeService {
+    type Result = ();
+
+    fn handle(&mut self, msg: SendTrainedClassifier, ctx: &mut Self::Context) -> Self::Result {
+        for (_,client) in self.clients.iter() {
+            client.try_send(msg.clone()).unwrap();
+        }
+    }
+}
+
 #[derive(Message)]
 pub struct ClientAgentStopped(pub SocketAddr);
 
-pub struct Eval {
+#[derive(Message,Clone)]
+struct SendTrainedClassifier {
+    path:&'static str,
+    file:Vec<u8>
+}
+
+struct Eval {
+    pub reply:Addr<EdgeService>,
     pub client_address:SocketAddr,
     pub task_id:usize,
     pub xs:Tensor
@@ -256,13 +424,22 @@ pub enum EvalResult {
     }
 }
 
+#[derive(Message)]
+struct EdgeServiceStart(pub Addr<EdgeService>);
+
+#[derive(Message)]
+pub struct TrainDeviceClassifier{
+    trainset:Vec<Tensor>,
+    label:Vec<i64>
+}
+
 impl Message for Eval {
     type Result = Result<EvalResult,()>;
 }
 
 fn main() {
     System::run(||{
-        let work_addr = SyncArbiter::start(1, || EdgeWorker::new("edge_classifier.pt","edge_main.pt"));
+        let work_addr = EdgeWorker::create(|_| EdgeWorker::new("edge_classifier.pt","edge_main.pt"));
 
         let edge_address = "127.0.0.1:12345".parse().unwrap();
         let cloud_address = "127.0.0.1:12346".parse().unwrap();
@@ -279,10 +456,14 @@ fn main() {
                     .forward(tcp_w.sink_map_err(|x|()))
                     .map(|_|())
                 );
+                let device_trainer = DeviceClassifierTraniner::create(|ctx|{
+                    DeviceClassifierTraniner::new("device_classifier.pt")
+                });
                 EdgeService {
                     clients: Default::default(),
                     worker: work_addr,
-                    cloud_writer: sender
+                    cloud_writer: sender,
+                    device_trainer
                 }
             });
             futures::future::ok(())

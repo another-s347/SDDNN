@@ -26,9 +26,14 @@ pub enum EdgeRequest {
 }
 
 #[derive(Serialize,Deserialize,Debug,Message)]
-pub struct EdgeResponse {
-    pub id:usize,
-    pub prob: TensorRepresentation
+pub enum EdgeResponse {
+    EvalResult {
+        id:usize,
+        prob: TensorRepresentation
+    },
+    ClassifierUpdate {
+        module:Vec<u8>
+    }
 }
 
 #[derive(Serialize,Deserialize,Debug,Message)]
@@ -114,6 +119,21 @@ impl TensorKind {
             TensorKind::ComplexDouble => Kind::ComplexDouble,
         }
     }
+}
+
+pub fn read_pred<T:AsRef<Path>>(dir: T) -> Vec<(usize,Tensor)> {
+    let mut files = Vec::new();
+    let mut tensors = Vec::new();
+    visit_dirs(dir.as_ref(), &mut files).unwrap();
+    for file in files {
+        let path = file.path();
+        let file = file.file_name();
+        let filename = file.into_string().unwrap();
+        let d: Vec<_> = filename.split('.').collect();
+        let id:usize = d[0].parse().unwrap();
+        tensors.push((id,Tensor::read_npy(path).unwrap()));
+    }
+    tensors
 }
 
 pub fn read_npy<T:AsRef<Path>>(dir: T) -> Vec<Tensor> {
