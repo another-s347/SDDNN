@@ -15,6 +15,8 @@ use bytes::BytesMut;
 use tch::nn::{Module, ModuleT};
 use chrono::{DateTime, Utc};
 use std::time::{Instant, Duration};
+use flate2::{GzBuilder, Compression};
+use flate2::write::GzEncoder;
 
 pub fn entropy(t:&Tensor) -> f64 {
     let c = (t.size()[1] as f64).log(2.);
@@ -38,7 +40,7 @@ impl DeviceWorker {
             main_path: tch::CModule::load(main_path).unwrap(),
             classifier: tch::CModule::load(classifier).unwrap(),
             extractor: tch::CModule::load(extractor).unwrap(),
-            threshold: 0.0
+            threshold: 0.2
         }
     }
 }
@@ -92,6 +94,8 @@ impl Handler<DeviceRequest> for EdgeConnector {
     fn handle(&mut self, msg: DeviceRequest, ctx: &mut Self::Context) -> Self::Result {
         let bytes = bincode::serialize(&msg).unwrap();
 //        println!("send {} MB",bytes.len() as f64/(1024.*1024.));
+//        let mut encoder = GzEncoder::new(Vec::new(),Compression::best());
+//        encoder.write(bytes.as_ref());
         self.tcp_writer.try_send(bytes::Bytes::from(bytes)).unwrap();
     }
 }

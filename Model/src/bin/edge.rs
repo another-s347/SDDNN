@@ -11,6 +11,8 @@ use std::path::Path;
 use tch::nn::Module;
 use bytes::Bytes;
 use tokio::sync::mpsc::Sender;
+use flate2::write::{GzEncoder, GzDecoder};
+use std::io::prelude::*;
 
 pub fn entropy(t:&Tensor) -> f64 {
     let c = (t.size()[1] as f64).log(2.);
@@ -155,6 +157,10 @@ impl Actor for ClientAgent {
 impl StreamHandler<bytes::BytesMut,std::io::Error> for ClientAgent {
     fn handle(&mut self, item: bytes::BytesMut, ctx: &mut Self::Context) {
         self.recv_bytes += item.len() as u64;
+//        let mut writer = Vec::new();
+//        let mut decoder = GzDecoder::new(writer);
+//        decoder.write_all(item.as_ref()).unwrap();
+//        writer = decoder.finish().unwrap();
         if let Ok(request) = bincode::deserialize::<DeviceRequest>(item.as_ref()) {
             match request {
                 DeviceRequest::Eval {
