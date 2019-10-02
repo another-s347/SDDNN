@@ -16,6 +16,7 @@ use std::io::prelude::*;
 use std::str::FromStr;
 use std::fs::DirBuilder;
 use std::process::ExitStatus;
+use structopt::StructOpt;
 
 pub fn entropy(t:&Tensor) -> f64 {
     let c = (t.size()[1] as f64).log(2.);
@@ -61,16 +62,16 @@ impl Handler<Eval> for EdgeWorker {
         if entropy(&classifier_result) < self.threshold {
             // save sample
             let pred = classifier_result.argmax(-1,false).int64_value(&[]);
-            self.trainset_buffer.push(msg.xs);
-            self.trainlabel_buffer.push(pred);
-            if self.trainset_buffer.len() > 100 {
-                msg.reply.try_send(
-                    TrainDeviceClassifier {
-                        trainset: self.trainset_buffer.drain(0..).collect(),
-                        label: self.trainlabel_buffer.drain(0..).collect()
-                    }
-                );
-            }
+           self.trainset_buffer.push(msg.xs);
+           self.trainlabel_buffer.push(pred);
+           if self.trainset_buffer.len() > 100 {
+               msg.reply.try_send(
+                   TrainDeviceClassifier {
+                       trainset: self.trainset_buffer.drain(0..).collect(),
+                       label: self.trainlabel_buffer.drain(0..).collect()
+                   }
+               );
+           }
             // exit
             println!("Task {}",msg.task_id);
             classifier_result.argmax(-1,false).print();
@@ -437,12 +438,23 @@ impl Message for Eval {
     type Result = Result<EvalResult,()>;
 }
 
+#[derive(StructOpt, Debug,Clone)]
+#[structopt(name = "edge")]
+struct Opt {
+    #[structopt(short, long, default_value="127.0.0.1:12345")]
+    listen:String,
+    #[structopt(short, long, default_value="127.0.0.1:12346")]
+    cloud:String
+}
+
 fn main() {
-    System::run(||{
+    let opt:Opt=Opt::from_args();
+
+    System::run(move ||{
         let work_addr = EdgeWorker::create(|_| EdgeWorker::new("edge_classifier.pt","edge_main.pt"));
 
-        let edge_address = "127.0.0.1:12345".parse().unwrap();
-        let cloud_address = "127.0.0.1:12346".parse().unwrap();
+        let edge_address = opt.listen.parse().unwrap();
+        let cloud_address = opt.cloud.parse().unwrap();
         let tcp_listener = tokio::net::TcpListener::bind(&edge_address).unwrap();
         let tcp_stream = tokio::net::TcpStream::connect(&cloud_address).and_then(|x|{
             let (reader,writer) = x.split();

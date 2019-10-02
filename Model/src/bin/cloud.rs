@@ -10,6 +10,7 @@ use tch::{CModule, Tensor};
 use std::path::Path;
 use tch::nn::Module;
 use bytes::Bytes;
+use structopt::StructOpt;
 
 struct CloudWorker {
     model:CModule
@@ -182,11 +183,20 @@ impl Message for Eval {
     type Result = Result<EvalResult,()>;
 }
 
+#[derive(StructOpt, Debug,Clone)]
+#[structopt(name = "cloud")]
+struct Opt {
+    #[structopt(short, long,default_value="127.0.0.1:12346")]
+    listen:String
+}
+
 fn main() {
-    System::run(||{
+    let opt:Opt = Opt::from_args();
+
+    System::run(move||{
         let work_addr = SyncArbiter::start(1, || CloudWorker::new("cloud.pt"));
 
-        let cloud_address = "127.0.0.1:12346".parse().unwrap();
+        let cloud_address = opt.listen.parse().unwrap();
         let tcp_listener = tokio::net::TcpListener::bind(&cloud_address).unwrap();
         let cloud_server = CloudService::create(move |x|{
             x.add_stream(tcp_listener.incoming());

@@ -3,7 +3,7 @@
 use tokio::prelude::*;
 use actix::prelude::*;
 use tokio::io::WriteHalf;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket, UdpFramed};
 use tokio::codec::{FramedRead,FramedWrite};
 use model::{EdgeResponse, DeviceRequest, TensorRepresentation, read_npy, read_pred};
 use tch::{CModule, IValue, Tensor, Kind};
@@ -11,13 +11,16 @@ use std::path::Path;
 use tch::vision::dataset::Dataset;
 use tch::data::Iter2;
 use std::ops::Deref;
-use bytes::BytesMut;
+use bytes::{BytesMut, BufMut};
 use tch::nn::{Module, ModuleT};
-use chrono::{DateTime, Utc};
 use std::time::{Instant, Duration};
 use flate2::{GzBuilder, Compression};
 use flate2::write::GzEncoder;
 use serde::de::value::U32Deserializer;
+use std::path::PathBuf;
+use structopt::StructOpt;
+use std::net::{SocketAddr, Ipv4Addr};
+use serde::{Deserialize,Serialize};
 
 static CLASSES:[&'static str;6] = ["buildings", "forest", "glacier", "mountain", "sea", "street"];
 
@@ -119,6 +122,11 @@ impl Handler<DeviceRequest> for EdgeConnector {
 
     fn handle(&mut self, msg: DeviceRequest, ctx: &mut Self::Context) -> Self::Result {
         let bytes = bincode::serialize(&msg).unwrap();
+//        self.controller.try_send((Task {
+//            instruction_number: bytes.len() as u32,
+//            identification: self.id.clone(),
+//            amount_data: bytes.len() as u32
+//        }, SocketAddr::new(Ipv4Addr::BROADCAST.into(), 12345))).unwrap();
 //        println!("send {} MB",bytes.len() as f64/(1024.*1024.));
 //        let mut encoder = GzEncoder::new(Vec::new(),Compression::best());
 //        encoder.write(bytes.as_ref());
@@ -156,7 +164,8 @@ pub struct TestLoader {
     current_index:usize,
     timestamp:Vec<Instant>,
     duras:f64,
-    pred_set:bool
+    pred_set:bool,
+    start:Instant
 }
 
 impl TestLoader {
@@ -177,7 +186,8 @@ impl TestLoader {
                 current_index: 0,
                 timestamp: vec![Instant::now();total],
                 duras: 0.0,
-                pred_set
+                pred_set,
+                start: Instant::now()
             }
         }
         else {
@@ -220,7 +230,8 @@ impl TestLoader {
                 current_index: 0,
                 timestamp: vec![Instant::now();total],
                 duras: 0.0,
-                pred_set
+                pred_set,
+                start: Instant::now()
             }
         }
     }
@@ -231,6 +242,7 @@ impl Actor for TestLoader {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         self.edge.try_send(SetTestloader(ctx.address())).unwrap();
+        self.start = Instant::now();
         ctx.notify(NextTest)
     }
 }
@@ -272,6 +284,13 @@ impl Handler<NextTest> for TestLoader {
         let index = self.current_index;
         if !self.pred_set && (index % 10 == 0 || index+1==self.xss.len()) {
             println!("Acc {:?}% {}/{}, duration == {}",100.*(self.correct as f64 / self.total as f64),self.correct,self.total,self.duras/self.total as f64);
+        }
+        if self.current_index >= 800 {
+            let now = Instant::now();
+            let dura = now.duration_since(self.start);
+            println!("Total time: {}",dura.as_secs_f64());
+            actix::System::current().stop();
+            return;
         }
         if self.current_index >= self.timestamp.len() {
             actix::System::current().stop();
@@ -381,18 +400,32 @@ enum DeviceEvalResult {
 #[derive(Message)]
 struct SetTestloader(pub Addr<TestLoader>);
 
-fn main() {
-    System::run(||{
-        let work_addr = SyncArbiter::start(1, || DeviceWorker::new(1,"device_main.pt","device_classifier.pt","device_extract.pt"));
+#[derive(StructOpt, Debug,Clone)]
+#[structopt(name = "device")]
+struct Opt {
+    #[structopt(short, long,default_value="127.0.0.1:12345")]
+    edge:String,
+    #[structopt(short, long)]
+    id:u32,
+    #[structopt(short, long)]
+    pred:bool
+}
 
-        let edge_address = "127.0.0.1:12345".parse().unwrap();
+fn main() {
+    let opt:Opt = Opt::from_args();
+
+    System::run(move||{
+        let id = opt.id;
+        let work_addr = SyncArbiter::start(1, move || DeviceWorker::new(id,"device_main.pt","device_classifier.pt","device_extract.pt"));
+
+        let edge_address = opt.edge.parse().unwrap();
         let tcp_stream = tokio::net::TcpStream::connect(&edge_address);
         let split_stream = tcp_stream.and_then(|x|{
             futures::future::ok(x.split())
         });
         actix::spawn(split_stream.and_then(move |(reader,writer)|{
             let worker = work_addr.clone();
-            let edge_connector = EdgeConnector::create(move |x|{
+            let edge_connector: Addr<EdgeConnector> = EdgeConnector::create(move |x|{
                 x.add_stream(FramedRead::new(reader, tokio::codec::LengthDelimitedCodec::new()));
                 let (sender,receiver) = tokio::sync::mpsc::channel(1024);
                 let tcp_w = FramedWrite::new(writer,tokio::codec::LengthDelimitedCodec::new());
@@ -404,10 +437,10 @@ fn main() {
                 EdgeConnector {
                     worker: work_addr,
                     tcp_writer: sender,
-                    test_loader: None
+                    test_loader: None,
                 }
             });
-            TestLoader::create(|_|TestLoader::new(worker ,edge_connector,true));
+            TestLoader::create(move|_|TestLoader::new(worker ,edge_connector,opt.pred));
             futures::future::ok(())
         }).map_err(|e|{
             dbg!(e);
